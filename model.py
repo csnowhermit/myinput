@@ -1,10 +1,12 @@
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import config
 
 '''
-    输入法模型
+    输入法模型：emb + prenet + encoder + highway_network + gru
 '''
 
 class MyInput(nn.Module):
@@ -15,76 +17,150 @@ class MyInput(nn.Module):
         self.word_dim = word_dim    # embedding成多少维
         self.encoder_num_banks = encoder_num_banks    # encoder结构重复次数
         self.num_highwaynet_blocks = num_highwaynet_blocks    # 高层次特征残差块的个数
+
+        num_units = self.word_dim // 2
         self.embedding = nn.Embedding(vocab_size, word_dim, padding_idx=1)
         self.prenet = nn.Sequential(
             nn.Linear(word_dim, word_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(word_dim, word_dim // 2),
+            nn.Linear(word_dim, num_units),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5)
         )
+
+        # encoder部分
+        self.encoder = Encoder(word_dim=self.word_dim, encoder_num_banks=16)
+
+        # highway-network结构
+        self.hn_linear = nn.Linear(num_units, num_units)
+
+        # GRU
+        self.gru_layers = 1    # GRU结构的层数
+        self.gru_hidden_dim = config.maxlen    # GRU隐藏层的dim，等于一句话的最大长度
+        self.gru = nn.GRU(num_units, num_units, self.gru_layers, bidirectional=True)    # 双向GRU：输入dim数，输出dim数，GRU结构的层数
+        self.hidden = self._init_hidden(num_units)
+
         self.relu = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
 
-        self.encoder = []
-        self.encoder.append(nn.Conv1d(word_dim//2, 150, 1, dilation=1, padding='SAME', bias=False))
-        for k in range(2, encoder_num_banks + 1):
-            self.encoder.append(nn.Conv1d(word_dim//2, 150, kernel_size=k, dilation=1, padding='SAME', bias=False))
+        # readout
+        self.readout = nn.Linear(self.word_dim, self.hanzi_size, bias=False)
 
+
+    def _init_hidden(self, dim):
+        return torch.randn(self.gru_layers * 2, self.gru_hidden_dim, dim)    # 双向GRU的话隐藏层层数需*2，隐藏dim，输出dim（输出dim需与gru的输出保持一致）
 
     def forward(self, x):
-        emb = self.embedding(x)    # 先做embedding
-        preout = self.prenet(emb)    # 做encoder前的预处理
+        emb = self.embedding(x)    # 先做embedding， [3, 50, 300]
+        preout = self.prenet(emb)    # 做encoder前的预处理, preout [3， 50， 150]
 
-        # encoder部分
-        num_units = self.embedding // 2
-        outputs = nn.Conv1d(x, 150, 1, dilation=1, padding='SAME', bias=False)
-        for k in range(2, self.encoder_num_banks+1):
-            output = nn.Conv1d(x, num_units, k)
-            outputs = torch.cat((outputs, output), axis=-1)    # -1表示按最后一个维度拼接
-        outputs = self.batch_normalize(outputs)
+        preout = preout.permute(0, 2, 1)    # 调整通道顺序，改为：[batch_size, emb_size, seqlen] [3, 150, 50]
+        # # encoder部分
+        enc = self.encoder(preout)    # [3, 150, 50]
+        enc += preout    # 残差连接 [3, 150, 50]
+
+        # highway-network模块
+        enc = enc.permute(0, 2, 1)    # 再转回[batch_size, seqlen, emb_size] [3, 50, 150]
+        for i in range(self.num_highwaynet_blocks):
+            H = self.relu(self.hn_linear(enc))
+            T = self.sigmoid(self.hn_linear(enc))
+            C = 1. - T
+            enc = H * T + enc * C    # highway-network模块中，enc始终为 [3, 50, 150]
+
+        # 双向GRU结构
+        # print("GRU:", enc.shape)    # [3, 50, 150]
+        outputs, hn = self.gru(enc, self.hidden)    # outputs [3, 50, 300]
+
+        ## Readout
+        outputs = self.readout(outputs)
+        return outputs
+
+
+
+
+'''
+    Encoder部分
+'''
+class Encoder(nn.Module):
+    def __init__(self, word_dim, encoder_num_banks):
+        super(Encoder, self).__init__()
+        self.word_dim = word_dim
+        self.num_units = word_dim // 2
+        self.encoder_num_banks = encoder_num_banks
+
+        self.conv_layers = []
+        self.conv_layers.append(nn.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=1, dilation=1, bias=False))
+        for k in range(2, self.encoder_num_banks + 1):
+            # tensoeflow中使用padding='SAME'参数确保卷积前后矩阵大小相同。
+            # 而pytorch是卷积前对边缘填充，padding=n，n表示在边缘填充几层。卷积之后的填充用F.pad()
+            self.conv_layers.append(nn.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=k))
+
+        self.bn1 = nn.BatchNorm1d(self.encoder_num_banks * self.num_units)    # Conv1D projections之前用这个
+        self.bn2 = nn.BatchNorm1d(self.num_units)    # Conv1D projections之后用这个bn
+        self.relu = nn.ReLU()
+
+        # maxpooling阶段
+        self.maxpooling = nn.MaxPool1d(kernel_size=2, stride=1)    # maxpooling完了仍然需要填充至原来大小
+        self.project1_conv1d = nn.Conv1d(self.encoder_num_banks * self.num_units, self.num_units, kernel_size=5)
+        self.project2_conv1d = nn.Conv1d(self.num_units, self.num_units, kernel_size=5)
+
+    def forward(self, x):
+        # encoder
+        outputs = self.conv_layers[0](x)    # x [3, 150, 50]
+        for k in range(1, len(self.conv_layers)):
+            output = self.conv_layers[k](x)
+
+            # 卷积之后填充至原来相同shape
+            padding_num = config.maxlen - output.shape[-1]
+            padding = [math.floor(padding_num / 2), math.ceil(padding_num / 2)]
+            output = F.pad(output, padding)
+
+            outputs = torch.cat([outputs, output], axis=1)  # 在第二个维度拼接：emb_size维度
+
+        outputs = self.bn1(outputs)    # outputs [3, 2400, 50]
         outputs = self.relu(outputs)
 
         # maxpooling
-        outputs = nn.MaxPool2d(outputs, 2, 1, padding='same')
-        outputs = nn.Conv1d(outputs, self.word_dim // 2, 5, padding='SAME')
-        outputs = self.batch_normalize(outputs)
+        outputs = self.maxpooling(outputs)    # [3, 2400, 49]
+        padding_num = config.maxlen - outputs.shape[-1]
+        padding = [math.floor(padding_num / 2), math.ceil(padding_num / 2)]
+        outputs = F.pad(outputs, padding)    # 填充至原来大小 [3, 2400, 50]
+
+        # Conv1D projections
+        outputs = self.project1_conv1d(outputs)
+        padding_num = config.maxlen - outputs.shape[-1]
+        padding = [math.floor(padding_num / 2), math.ceil(padding_num / 2)]
+        outputs = F.pad(outputs, padding)  # 填充至原来大小
+
+        outputs = self.bn2(outputs)
         outputs = self.relu(outputs)
-        outputs = nn.Conv1d(outputs, self.word_dim // 2, 5, padding='SAME')
-        outputs = self.batch_normalize(outputs)
+
+        outputs = self.project2_conv1d(outputs)
+        padding_num = config.maxlen - outputs.shape[-1]
+        padding = [math.floor(padding_num / 2), math.ceil(padding_num / 2)]
+        outputs = F.pad(outputs, padding)  # 填充至原来大小
+
+        outputs = self.bn2(outputs)
         outputs = self.relu(outputs)
 
-        outputs += preout    # 相当于残差连接
-
-        # highway-network
-        num_units = outputs.shape[-1]
-        for i in range(self.num_highwaynet_blocks):
-            H = self.relu(nn.Linear(outputs, num_units))
-            T = self.sigmoid(nn.Linear(outputs, num_units))
-            C = 1. - T
-            outputs = H * T + outputs * C
-
-        # 双向GRU结构
-        gru = nn.GRU(150, 150, 2)
-        input = torch.randn(200, 16, 150)
-        h0 = torch.randn(2, 16, 150)
-        outputs, hn = gru(outputs, h0)
-        outputs = torch.cat(outputs, 2)
-
-        ## Readout
-        outputs = nn.Linear(outputs, self.hanzi_size, bias=False)
         return outputs
 
-    def batch_normalize(self, x):
-        x = torch.unsqueeze(x, dim=1)    # 先扩展为四维向量
-        x = nn.BatchNorm2d(x)
-        return torch.squeeze(x, dim=1)    # 再还原回三维向量
+
+
 
 if __name__ == '__main__':
     myinput = MyInput(vocab_size=42, hanzi_size=400)    # 42个字母，400个汉字
-    x = torch.randn([config.batch_size, 16, 300], dtype=torch.float32)
-    outputs = myinput(x)
-    outputs = torch.argmax(outputs)  # 找属于哪个汉字的得分值最大，这里拿到的是index
+    x = [[1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+         [2, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+         [3, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]
 
+    x = torch.LongTensor(x)
+    outputs = myinput(x)
+    print("outputs:", outputs.shape)    # [3, 50, 400], 400表示当前行当前字属于哪一个字的概率
+    preds = torch.argmax(outputs, 2)  # 找属于哪个汉字的得分值最大，这里拿到的是index
+    print("preds:", preds.shape)
 
