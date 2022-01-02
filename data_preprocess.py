@@ -11,7 +11,7 @@ import config
 '''
     数据预处理
     输入格式：按照sample.txt文件写，一行一句话
-    输出：<id, 拼音>，<id，句子>两个json文件，vocab.json
+    输出：data.txt（拼音序列\t汉字序列），vocab.json
 '''
 
 '''
@@ -26,11 +26,11 @@ def align(sentences):
     for char, p in zip(sentences.replace(" ", ""), pylist):
         hanzilist.extend([char] + ["_"] * (len(p) - 1))
 
-    pylist = "".join(pylist)
-    hanzilist = "".join(hanzilist)
+    py_str = "".join(pylist)
+    hanzi_str = "".join(hanzilist)
 
-    assert len(pylist) == len(hanzilist), "The hanzis and the pinyins must be the same in length."
-    return pylist, hanzilist
+    assert len(py_str) == len(hanzi_str), "The hanzis and the pinyins must be the same in length."
+    return py_str, hanzi_str
 
 '''
     用正则表达式过滤掉字母、阿拉伯数字等
@@ -47,7 +47,7 @@ def clean(text):
 '''
 def build_vocab(hanzi_sent_list):
     # 拼音部分
-    if config.isqwerty:
+    if config.is_qwerty:
         pinyins = "EUabcdefghijklmnopqrstuvwxyz0123456789。，！？"  # E: Empty, U: Unknown
         pinyin2idx = {pnyn: idx for idx, pnyn in enumerate(pinyins)}
         idx2pinyin = {idx: pnyn for idx, pnyn in enumerate(pinyins)}
@@ -74,36 +74,28 @@ def build_vocab(hanzi_sent_list):
 
 
 if __name__ == '__main__':
-    pinyinDict = {}
-    hanziDict = {}
     hanzi_sent_list = []    # 用于构建汉字vocab
+    fout = open("data/data.txt", 'w', encoding='utf-8')
     with codecs.open("data/sample.txt", 'r', 'utf-8') as fin:
-        idx = 0    # 以行号作为key，从0开始
         while True:
             line = fin.readline()
             if not line:
                 break
 
-            try:
-                sent = line.strip()
-                sent = clean(sent)
-                hanzi_sent_list.append(sent)
-                if len(sent) > 0:
-                    pylist, hanzilist = align(sent)
-                    pinyinDict[str(idx)] = pylist
-                    hanziDict[str(idx)] = hanzilist
-            except:
-                continue  # it's okay as we have a pretty big corpus!
-
-            idx += 1
+            sent = line.strip()
+            sent = clean(sent)
+            hanzi_sent_list.append(sent)
+            if len(sent) > 0:
+                py_str, hanzi_str = align(sent)
+                fout.write("%s\t%s\n" % (py_str, hanzi_str))
+                fout.flush()
 
         # 保存文件
-        json.dump(pinyinDict, open('data/pinyinDict.json', 'w'))
-        json.dump(hanziDict, open('data/hanziDict.json', 'w'))
+        fout.close()
 
         # 构建vocab
         pinyin2idx, idx2pinyin, hanzi2idx, idx2hanzi = build_vocab(hanzi_sent_list)
-        if config.isqwerty:
+        if config.is_qwerty:
             json.dump((pinyin2idx, idx2pinyin, hanzi2idx, idx2hanzi), open('data/vocab.qwerty.json', 'w'))
         else:
             json.dump((pinyin2idx, idx2pinyin, hanzi2idx, idx2hanzi), open('data/vocab.nine.json', 'w'))
