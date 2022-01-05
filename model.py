@@ -89,12 +89,13 @@ class Encoder(nn.Module):
         self.num_units = word_dim // 2
         self.encoder_num_banks = encoder_num_banks
 
-        self.conv_layers = []
-        self.conv_layers.append(nn.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=1, dilation=1, bias=False))
+        conv_layers = []
+        conv_layers.append(nn.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=1, dilation=1, bias=False))
         for k in range(2, self.encoder_num_banks + 1):
             # tensoeflow中使用padding='SAME'参数确保卷积前后矩阵大小相同。
             # 而pytorch是卷积前对边缘填充，padding=n，n表示在边缘填充几层。卷积之后的填充用F.pad()
-            self.conv_layers.append(nn.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=k))
+            conv_layers.append(nn.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=k))
+        self.conv_layers = nn.Sequential(*conv_layers)
 
         self.bn1 = nn.BatchNorm1d(self.encoder_num_banks * self.num_units)    # Conv1D projections之前用这个
         self.bn2 = nn.BatchNorm1d(self.num_units)    # Conv1D projections之后用这个bn
