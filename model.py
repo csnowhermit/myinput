@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import config
+import myconv
 
 '''
     输入法模型：emb + prenet + encoder + highway_network + gru
@@ -77,8 +78,6 @@ class MyInput(nn.Module):
         return outputs
 
 
-
-
 '''
     Encoder部分
 '''
@@ -94,7 +93,8 @@ class Encoder(nn.Module):
         for k in range(2, self.encoder_num_banks + 1):
             # tensoeflow中使用padding='SAME'参数确保卷积前后矩阵大小相同。
             # 而pytorch是卷积前对边缘填充，padding=n，n表示在边缘填充几层。卷积之后的填充用F.pad()
-            conv_layers.append(nn.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=k))
+            # conv_layers.append(nn.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=k))
+            conv_layers.append(myconv.Conv1d(in_channels=self.num_units, out_channels=self.num_units, kernel_size=k))
         self.conv_layers = nn.Sequential(*conv_layers)
 
         self.bn1 = nn.BatchNorm1d(self.encoder_num_banks * self.num_units)    # Conv1D projections之前用这个
@@ -112,10 +112,12 @@ class Encoder(nn.Module):
         for k in range(1, len(self.conv_layers)):
             output = self.conv_layers[k](x)
 
-            # 卷积之后填充至原来相同shape
-            padding_num = config.maxlen - output.shape[-1]
-            padding = [math.floor(padding_num / 2), math.ceil(padding_num / 2)]
-            output = F.pad(output, padding)
+            # # 采用自定义Conv后就不用手动填充了
+            # # 卷积之后填充至原来相同shape
+            # padding_num = config.maxlen - output.shape[-1]
+            # # padding = [math.floor(padding_num / 2), math.ceil(padding_num / 2)]    # 这种填充方式不对，应该在右或下填充
+            # padding = [0, math.ceil(padding_num)]
+            # output = F.pad(output, padding)
 
             outputs = torch.cat([outputs, output], axis=1)  # 在第二个维度拼接：emb_size维度
 
