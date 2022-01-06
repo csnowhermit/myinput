@@ -7,6 +7,8 @@ from torch.nn.modules.utils import _single, _pair, _triple
 
 '''
     自定义Conv：实现Tensorflow conv中padding='same'功能
+    Tensorflow中padding='same'时，卷积到最后，剩余数据满足不了kernel_size大小时，在右侧、下侧填充0至满足卷积核大小再进行卷积；
+    padding='valid'时，卷积到最后，剩余数据满足不了kernel_size大小时，剩余数据直接舍弃；
 '''
 
 
@@ -99,7 +101,7 @@ def conv2d_same_padding(input, weight, bias=None, stride=1, padding=1, dilation=
     cols_odd = (padding_rows % 2 != 0)
 
     if rows_odd or cols_odd:
-        input = F.pad(input, [0, int(cols_odd), 0, int(rows_odd)])    # 左右上下
+        input = F.pad(input, [0, int(cols_odd), 0, int(rows_odd)])    # 左右上下。右下填充，和tf中padding='same'填充方式一样
 
     return F.conv2d(input, weight, bias, stride,
                   padding=(padding_rows // 2, padding_cols // 2),
@@ -134,7 +136,7 @@ def conv1d_same_padding(input, weight, bias=None, stride=1, padding=1, dilation=
     rows_odd = (padding_rows % 2 != 0)
 
     if rows_odd:
-        input = F.pad(input, [0, int(rows_odd)])    # 左右
+        input = F.pad(input, [0, int(rows_odd)])    # 左右。右侧填充，和tf中padding='same'填充方式一样
 
     return F.conv1d(input, weight, bias, stride,
                   padding=(padding_rows // 2),
